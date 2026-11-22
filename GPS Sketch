@@ -1,0 +1,245 @@
+/*
+ * FINAL Satellite Tracker - ESP32-C3 + Nokia 5110 + NEO-6M GPS
+ * Fixed with 16KB stack for SGP4 calculations
+ */
+
+#include <TinyGPSPlus.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_PCD8544.h>
+#include <Sgp4.h>
+
+// ---------- Nokia 5110 pins ----------
+#define LCD_CLK   4
+#define LCD_DIN   6
+#define LCD_DC    7
+#define LCD_CE    8
+#define LCD_RST   9
+
+Adafruit_PCD8544 display = Adafruit_PCD8544(LCD_CLK, LCD_DIN, LCD_DC, LCD_CE, LCD_RST);
+
+// ---------- GPS pins ----------
+#define GPS_RX    3 // from GPS TX trnsmitter which goes to pin 3 of the ESP32
+#define GPS_TX    -1 // from GPS RX riceiver we not recieving therefore remove this connection which goes to pin 2 of ESP32         
+
+HardwareSerial gpsSerial(1); 
+TinyGPSPlus gps;
+
+// ---------- Satellite tracking ----------
+Sgp4 satTracker;
+
+char tleList[][3][70] = {
+  {"ISS",
+   "1 25544U 98067A   26325.50000000  .00016764  00000-0  10270-3 0  9993",
+   "2 25544  51.6400 200.0000 0006000  90.0000 270.0000 15.49000000000000"},
+  {"HUBBLE",
+   "1 20580U 90037B   26325.50000000  .00000764  00000-0  39560-4 0  9990",
+   "2 20580  28.4700 100.0000 0002746 280.0000  80.0000 15.09000000000000"},
+  {"NOAA 19",
+   "1 33591U 09005A   26325.50000000  .00000093  00000-0  69560-4 0  9992",
+   "2 33591  99.1900  50.0000 0014000 100.0000 260.0000 14.12000000000000"}
+};
+
+const int NUM_SATS = 3;
+
+// Store only the best satellite (saves memory)
+struct SatResult {
+  char name[15];
+  float elevation;
+  float azimuth;
+};
+
+SatResult bestSat;
+int visibleCount = 0;
+
+unsigned long lastDisplayUpdate = 0;
+bool gpsLocked = false;
+float myLat = 0, myLon = 0, myAlt = 20.0;
+
+TaskHandle_t satTaskHandle = NULL;
+
+// =====================================================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("\n=== Satellite Tracker FINAL ===");
+
+  display.begin();
+  display.setRotation(2);
+  display.setContrast(50);
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(BLACK);
+  display.setCursor(0, 0);
+  display.println("Sat Tracker");
+  display.println("Waiting GPS...");
+  display.display();
+
+  gpsSerial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+  Serial.println("GPS listening on GPIO3");
+  
+  // Create satellite calculation task with 16KB stack
+  xTaskCreate(
+    satTask,
+    "SatTask",
+    16384,              // 16KB stack (doubled!)
+    NULL,
+    1,
+    &satTaskHandle
+  );
+}
+
+// =====================================================
+void loop() {
+  while (gpsSerial.available() > 0) {
+    char c = gpsSerial.read();
+    if (gps.encode(c)) {
+      if (gps.location.isValid() && !gpsLocked) {
+        myLat = gps.location.lat();
+        myLon = gps.location.lng();
+        if (gps.altitude.isValid()) myAlt = gps.altitude.meters();
+        gpsLocked = true;
+        Serial.printf("\n*** GPS LOCKED! Lat: %.4f, Lon: %.4f ***\n", myLat, myLon);
+      }
+    }
+  }
+
+  unsigned long now = millis();
+  if (gpsLocked && (now - lastDisplayUpdate > 5000)) {
+    lastDisplayUpdate = now;
+    renderDisplay();
+  }
+
+  if (!gpsLocked && (now - lastDisplayUpdate > 1000)) {
+    lastDisplayUpdate = now;
+    showGPSSearchScreen();
+  }
+}
+
+// =====================================================
+void satTask(void* parameter) {
+  for (;;) {
+    if (gpsLocked) {
+      updateSatellites();
+    }
+    vTaskDelay(5000 / portTICK_PERIOD_MS);
+  }
+}
+
+// =====================================================
+void updateSatellites() {
+  visibleCount = 0;
+  double jd = getJulianDate();
+  float bestElevation = 0;
+
+  // Calculate one satellite at a time, keep only the best
+  for (int i = 0; i < NUM_SATS; i++) {
+    satTracker.init(tleList[i][0], tleList[i][1], tleList[i][2]);
+    satTracker.findsat(jd);
+
+    float satLat = satTracker.satLat;
+    float satLon = satTracker.satLon;
+    float satAlt = satTracker.satAlt;
+
+    float Re = 6378.137;
+    float lat1 = myLat * DEG_TO_RAD;
+    float lon1 = myLon * DEG_TO_RAD;
+    float lat2 = satLat * DEG_TO_RAD;
+    float lon2 = satLon * DEG_TO_RAD;
+
+    float xo = (Re + myAlt/1000.0) * cos(lat1) * cos(lon1);
+    float yo = (Re + myAlt/1000.0) * cos(lat1) * sin(lon1);
+    float zo = (Re + myAlt/1000.0) * sin(lat1);
+
+    float xs = (Re + satAlt) * cos(lat2) * cos(lon2);
+    float ys = (Re + satAlt) * cos(lat2) * sin(lon2);
+    float zs = (Re + satAlt) * sin(lat2);
+
+    float dx = xs - xo;
+    float dy = ys - yo;
+    float dz = zs - zo;
+
+    float sinLat = sin(lat1);
+    float cosLat = cos(lat1);
+    float sinLon = sin(lon1);
+    float cosLon = cos(lon1);
+
+    float e = -sinLon * dx + cosLon * dy;
+    float n = -sinLat * cosLon * dx - sinLat * sinLon * dy + cosLat * dz;
+    float u =  cosLat * cosLon * dx + cosLat * sinLon * dy + sinLat * dz;
+
+    float elevation = atan2(u, sqrt(e*e + n*n)) * RAD_TO_DEG;
+    float azimuth = atan2(e, n) * RAD_TO_DEG;
+    if (azimuth < 0) azimuth += 360.0;
+
+    // DEBUG: Print the elevation of the first satellite (ISS) to prove math works
+    if (i == 0) {
+      Serial.printf("DEBUG: ISS Elevation is %.1f degrees\n", elevation);
+    }
+
+    // Keep only the highest elevation satellite (must be > 0 to be visible)
+    if (elevation > 0 && elevation > bestElevation) {
+      bestElevation = elevation;
+      strncpy(bestSat.name, tleList[i][0], 14);
+      bestSat.name[14] = '\0';
+      bestSat.elevation = elevation;
+      bestSat.azimuth = azimuth;
+      visibleCount = 1;
+    }
+  }
+}
+
+// =====================================================
+void renderDisplay() {
+  display.clearDisplay();
+
+  display.drawRect(0, 0, 84, 10, BLACK);
+  display.setCursor(2, 2);
+  display.printf("%d SATS", visibleCount);
+  display.drawLine(0, 10, 84, 10, BLACK);
+
+  if (visibleCount == 0) {
+    display.setCursor(2, 14);
+    display.println("No sats above");
+    display.setCursor(2, 24);
+    display.printf("%.2f", myLat);
+    display.setCursor(2, 34);
+    display.printf("%.2f", myLon);
+  } else {
+    display.setCursor(0, 13);
+    display.print(bestSat.name);
+    display.setCursor(0, 21);
+    display.printf("El:%3.0f Az:%3.0f", 
+                   bestSat.elevation, bestSat.azimuth);
+  }
+  display.display();
+}
+
+void showGPSSearchScreen() {
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.println("SEARCHING GPS");
+  display.drawLine(0, 8, 84, 8, BLACK);
+  display.setCursor(0, 12);
+  display.printf("Sats: %d", gps.satellites.value());
+  display.setCursor(0, 22);
+  display.println("Almost there...");
+  display.display();
+}
+
+// =====================================================
+double getJulianDate() {
+  if (gps.date.isValid() && gps.time.isValid()) {
+    return julianDay(gps.date.year(), gps.date.month(), gps.date.day(),
+                     gps.time.hour(), gps.time.minute(), gps.time.second());
+  }
+  return 2461366.0;
+}
+
+double julianDay(int y, int m, int d, int h, int mi, int s) {
+  if (m <= 2) { y--; m += 12; }
+  int A = y / 100;
+  int B = 2 - A + A / 4;
+  double JD = floor(365.25 * (y + 4716)) + floor(30.6001 * (m + 1)) + d + B - 1524.5;
+  JD += (h + mi / 60.0 + s / 3600.0) / 24.0;
+  return JD;
+}
